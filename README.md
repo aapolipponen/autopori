@@ -1,6 +1,8 @@
 # autopori
 Hakee päivän Fingerporin (tai muun sarjakuvan) RSS-syötteestä ja asettaa sen Windowsin taustakuvaksi
 
+## Ohjeet
+
 Pyöritä seuraava admin powershellissä:
 
 Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
