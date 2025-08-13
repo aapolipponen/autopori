@@ -1,4 +1,5 @@
-﻿# autopori-installer.ps1 – Asenna AutoPori ja valitse sarjakuvasyöte
+﻿# autopori-installer.ps1 – Asenna AutoPori, rekisteröi suoritettavaksi kirjautuessa ja suorita heti
+# Suositus: Aja asennusvalvojan oikeuksin (elevated) jotta scheduled task -rekisteröinti voi pyytää korkeampia oikeuksia.
 
 $targetFolder     = "$env:APPDATA\autopori"
 $mainScriptPath   = Join-Path $targetFolder "autopori.ps1"
@@ -46,21 +47,34 @@ if (-not (Test-Path $targetFolder)) {
     New-Item -ItemType Directory -Path $targetFolder | Out-Null
 }
 
-# Luo päivittäinen ajoskripti (autopori.ps1)
+# Luo optimoitu päivittäinen ajoskripti
 $dailyRunnerTemplate = @'
-# autopori.ps1 – Hae sarjakuva ja aseta taustakuvaksi
+# autopori.ps1 – Hae sarjakuva ja aseta taustakuvaksi (optimized)
 
 $feedUrl  = "{0}"
 $savePath = "{1}"
 
+# Precompile .NET assembly only once
+if (-not ("Wallpaper" -as [type])) {{
+    Add-Type @"  
+    using System.Runtime.InteropServices;
+    public class Wallpaper {{
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
+    }}
+"@
+}}
+
+# Fetch comic with timeout
 try {{
-    $response = Invoke-WebRequest -Uri $feedUrl -UseBasicParsing
+    $response = Invoke-WebRequest -Uri $feedUrl -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
     [xml]$xml = $response.Content
 }} catch {{
-    Write-Host "RSS-syötteen hakeminen tai jäsentäminen epäonnistui: $feedUrl" -ForegroundColor Red
+    Write-Host "RSS-syötteen hakeminen epäonnistui: $($_.Exception.Message)" -ForegroundColor Red
     exit 1
 }}
 
+# Etsi kuvan URL
 $description = $xml.rss.channel.item[0].description.'#cdata-section'
 if ($description -match '<img.+?src="(.+?)"') {{
     $imageUrl = $matches[1] -replace '\?.*$',''
@@ -69,21 +83,27 @@ if ($description -match '<img.+?src="(.+?)"') {{
     exit 1
 }}
 
-Invoke-WebRequest -Uri $imageUrl -OutFile $savePath
-
-# Aseta taustakuva
-Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name WallpaperStyle -Value "6"
-Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name TileWallpaper   -Value "0"
-
-Add-Type @"  
-using System.Runtime.InteropServices;
-public class Wallpaper {{
-    [DllImport("user32.dll", SetLastError = true)]
-    public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
+# Lataa kuva
+try {{
+    Invoke-WebRequest -Uri $imageUrl -OutFile $savePath -TimeoutSec 15 -ErrorAction Stop
+}} catch {{
+    Write-Host "Kuvan lataaminen epäonnistui: $imageUrl" -ForegroundColor Red
+    exit 1
 }}
-"@
 
-[Wallpaper]::SystemParametersInfo(20, 0, $savePath, 3)
+# Tarkista onko taustakuva jo sama
+$currentWallpaper = [Microsoft.Win32.Registry]::GetValue(
+    "HKCU:\Control Panel\Desktop", 
+    "Wallpaper", 
+    ""
+)
+
+if ($currentWallpaper -ne $savePath) {{
+    # Aseta vain jos kuva on muuttunut
+    Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name WallpaperStyle -Value "6"
+    Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name TileWallpaper   -Value "0"
+    [Wallpaper]::SystemParametersInfo(20, 0, $savePath, 3)
+}}
 '@ -f $feedUrl, $savePath
 
 $dailyRunnerTemplate | Set-Content -Encoding UTF8 -Path $mainScriptPath
@@ -125,6 +145,25 @@ if (Test-Path $autoporiFolder) {{
     Write-Host "Poistettu AutoPori-kansio." -ForegroundColor Green
 }}
 
+# Poista Scheduled Task (AutoPori)
+try {{
+    if (Get-ScheduledTask -TaskName "AutoPori" -ErrorAction SilentlyContinue) {{
+        Unregister-ScheduledTask -TaskName "AutoPori" -Confirm:$false
+        Write-Host "Scheduled task 'AutoPori' poistettu." -ForegroundColor Green
+    }}
+}} catch {{
+    # fallback: schtasks
+    schtasks /Delete /TN "AutoPori" /F | Out-Null
+}}
+
+# Poista HKCU Run -avain, jos asetettu
+try {{
+    if (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "AutoPori" -ErrorAction SilentlyContinue) {{
+        Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "AutoPori" -ErrorAction SilentlyContinue
+        Write-Host "Run-avain poistettu." -ForegroundColor Green
+    }}
+}} catch {{}}
+
 # Palauta taustakuva mustaksi
 Add-Type -AssemblyName System.Drawing
 $tempWall = "$env:TEMP\black_wallpaper.bmp"
@@ -156,14 +195,100 @@ $removalTemplate | Set-Content -Encoding UTF8 -Path $removeScriptPath
 $WScriptShell = New-Object -ComObject WScript.Shell
 $shortcut      = $WScriptShell.CreateShortcut($shortcutPath)
 $shortcut.TargetPath      = "powershell.exe"
-$shortcut.Arguments       = "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$mainScriptPath`""
+$shortcut.Arguments       = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$mainScriptPath`""
 $shortcut.WorkingDirectory = $targetFolder
 $shortcut.Save()
 
-# Pyöritä autopori.ps1
-Start-Process powershell -ArgumentList "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$mainScriptPath`""
+# Luo optimoitu tehtävä XML-määrittely (nopeampi käynnistys)
+$taskXml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>AutoPori: fetch daily comic and set wallpaper</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>$($env:USERDOMAIN)\$($env:USERNAME)</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>true</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT1M</ExecutionTimeLimit>
+    <Priority>5</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>powershell.exe</Command>
+      <Arguments>-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$mainScriptPath"</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"@
+
+$taskXmlPath = Join-Path $env:TEMP "AutoPoriTask.xml"
+$taskXml | Set-Content -Path $taskXmlPath -Encoding Unicode
+
+# Rekisteröi tehtävä käyttäen optimoitua XML-määritystä
+try {
+    schtasks.exe /Create /XML "$taskXmlPath" /TN "AutoPori" /F
+    Write-Host "Scheduled task luotu optimoiduilla asetuksilla." -ForegroundColor Green
+    Remove-Item $taskXmlPath -Force -ErrorAction SilentlyContinue
+} catch {
+    Write-Host "ScheduledTask XML -rekisteröinti epäonnistui, kokeillaan schtasks-fallbackia..." -ForegroundColor Yellow
+    try {
+        $arguments = @(
+            "/Create",
+            "/TN", "AutoPori",
+            "/TR", "`"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$mainScriptPath`"`"",
+            "/SC", "ONLOGON",
+            "/RL", "LIMITED",
+            "/F"
+        )
+        Start-Process -FilePath "schtasks.exe" -ArgumentList $arguments -NoNewWindow -Wait -ErrorAction Stop
+        Write-Host "Scheduled task luotu schtasksilla." -ForegroundColor Green
+    } catch {
+        Write-Host "Scheduled taskin luonti epäonnistui." -ForegroundColor Red
+    }
+}
+
+# Lisää HKCU Run -avain fallbackiksi
+try {
+    Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "AutoPori" -Value "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$mainScriptPath`""
+    Write-Host "HKCU Run -avain asetettu fallbackiksi." -ForegroundColor Green
+} catch {
+    Write-Host "HKCU Run -avaimen asettaminen epäonnistui." -ForegroundColor Yellow
+}
+
+# Suorita skripti heti asennuksen jälkeen
+try {
+    Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$mainScriptPath`"" -WindowStyle Hidden
+    Write-Host "Autopori käynnistetty välittömästi." -ForegroundColor Cyan
+} catch {
+    Write-Host "Autoporin välitön käynnistys epäonnistui." -ForegroundColor Red
+}
 
 Write-Host "`nSarjakuva asennettu onnistuneesti!" -ForegroundColor Cyan
 Write-Host "Valittu syöte: $feedUrl"
-Write-Host "Taustakuva päivittyy kirjautumisen yhteydessä."  
+Write-Host "Taustakuva päivittyy kirjautumisen yhteydessä (Scheduled Task)."  
 Write-Host "Ohjelman poisto: suorita työpöydällä oleva 'remove-autopori.ps1'." -ForegroundColor Yellow

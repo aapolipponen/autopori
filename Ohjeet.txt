@@ -2,6 +2,6 @@ Pyöritä seuraava admin powershellissä:
 
 Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 
-sitten käynnistä autopori-installer.ps1 tiedosto
+sitten käynnistä autopori-installer.ps1 tiedosto admin powershellissä
 
-ohjelman saa poistettua pyörittämällä remove-autopori.ps1 tiedoston joka ilmestyy työpöydälle
+ohjelman saa poistettua pyörittämällä remove-autopori.ps1 tiedoston (huom. Suorita taas admin oikeuksilla) joka ilmestyy työpöydälle
